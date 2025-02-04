@@ -30,14 +30,46 @@ amiDeleteIfMissingTag() {
   fi
 }
 
+getHighest4StableVersions() {
+  local reg=$1
+  local kairosVersions
+  local stableVersions=()
+  local sortedVersions
+  local highest4StableVersions
+
+  # Get all Kairos versions
+  mapfile -t kairosVersions < <(aws --profile "$AWS_PROFILE" --region "$reg" ec2 describe-images --owners self --query 'Images[].Tags[?Key==`KairosVersion`].Value' --output text)
+
+  # Filter out non-stable versions (those containing '-rc')
+  for version in "${kairosVersions[@]}"; do
+    if [[ ! $version =~ -rc ]]; then
+      stableVersions+=("$version")
+    fi
+  done
+
+  # Sort the stable versions and keep only the highest 4
+  IFS=$'\n' sortedVersions=($(sort -V <<<"${stableVersions[*]}"))
+  unset IFS
+  highest4StableVersions=("${sortedVersions[@]: -4}")
+
+  # Return the highest 4 stable versions
+  echo "${highest4StableVersions[@]}"
+}
+
 cleanupOldVersionsRegion() {
   local reg=$1
 
   mapfile -t allAmis < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-images --owners self --query 'Images[].ImageId' --output text)
-  mapfile -t allTags < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-images --owners self --query 'Images[].Tags' --output text)
   for img in "${allAmis[@]}"; do
     amiDeleteIfMissingTag $reg $img "KairosVersion"
   done
+
+  highest4StableVersions=($(getHighest4StableVersions "$reg"))
+  echo "Highest 4 stable versions: ${highest4StableVersions[@]}"
+  # TODO:
+  # - Delete all AMIs that are not in the highest 4 stable versions
+  # - Cleanup snapshots that don't have an associated AMI
+  # - Cleanup s3 files that don't have an associated AMI
 }
 
 cleanupOldVersions() {
