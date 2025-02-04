@@ -11,9 +11,9 @@ set -e
 set -o pipefail
 
 checkArguments() {
-  if [ $# -lt 1 ]; then
-    echo "Error: You need to specify the cloud image to upload."
-    echo "Usage: $0 <cloud-image>"
+  if [ $# -lt 2 ]; then
+    echo "Error: You need to specify the cloud image to upload and the Kairos version (to tag resources)."
+    echo "Usage: $0 <cloud-image> <kairos-version>"
     exit 1
   fi
 
@@ -115,6 +115,7 @@ uploadImageToS3() {
   local file
   local baseName
   file="$1"
+  kairosVersion="$2"
   baseName=$(basename "$file")
 
   if AWS s3 ls "$AWS_S3_BUCKET/$baseName" > /dev/null 2>&1; then
@@ -122,6 +123,8 @@ uploadImageToS3() {
   else
     echo "File '$baseName' does not exist in S3 bucket '$AWS_S3_BUCKET'. Uploading now."
     AWS s3 cp "$1" "s3://$AWS_S3_BUCKET/$baseName"
+
+    AWS s3api put-object-tagging --bucket "$AWS_S3_BUCKET" --key "$baseName" --tagging "TagSet=[{Key=KairosVersion,Value=$2}]"
   fi
 }
 
@@ -149,6 +152,7 @@ waitForSnapshotCompletion() {
 
 importAsSnapshot() {
   local file="$1"
+  local kairosVersion="$2"
   local snapshotID
 
   snapshotID=$(AWS ec2 describe-snapshots --filters "Name=tag:SourceFile,Values=$file" --query "Snapshots[0].SnapshotId" --output text)
@@ -174,7 +178,8 @@ EOF
 
   snapshotID=$(waitForSnapshotCompletion "$taskID" | tail -1 | tee /dev/fd/2)
   echo "Adding tag to the snapshot with ID: $snapshotID"
-  AWS ec2 create-tags --resources "$snapshotID" --tags "Key=SourceFile,Value=$file"
+  AWS ec2 create-tags --resources "$snapshotID" \
+    --tags Key=Name,Value=$file, Key=SourceFile,Value=$file Key=KairosVersion,Value=$kairosVersion
 
   echo "$snapshotID" # Return the snapshot ID so that we can grab it with `tail -1`
 }
@@ -182,6 +187,7 @@ EOF
 checkImageExistsOrCreate() {
   local imageName="$1"
   local snapshotID="$2"
+  local kairosVersion="$3"
   local imageID
 
   # Check if the image already exists
@@ -205,12 +211,15 @@ checkImageExistsOrCreate() {
       --query 'ImageId' \
       --output text)
 
+    AWS ec2 create-tags --resources "$imageID" \
+      --tags Key=KairosVersion,Value=$kairosVersion Key=Name,Value=$imageName Key=Project,Value=Kairos
+
     echo "Image '$imageName' created with Image ID: $imageID"
   fi
 
   waitAMI "$imageID" "$AWS_REGION"
   makeAMIpublic "$imageID" "$AWS_REGION"
-  copyToAllRegions "$imageID" "$imageName" "$description"
+  copyToAllRegions "$imageID" "$imageName" "$description" "$kairosVersion"
 }
 
 # Function to wait for the AMI to become available
@@ -248,13 +257,13 @@ copyToAllRegions() {
   local imageID="$1"
   local imageName="$2"
   local description="$3"
+  local kairosVersion="$4"
 
   echo "Copying AMI '$imageName ($imageID)' to all regions"
   mapfile -t regions < <(AWS ec2 describe-regions | jq -r '.Regions[].RegionName')
   for reg in "${regions[@]}"; do
     # If the current region is the same as the region we are trying to copy, just ignore, the AMI is already there
-    if [[ "${AWS_REGION}" == "${reg}" ]]
-      then
+    if [[ "${AWS_REGION}" == "${reg}" ]]; then
         continue
     fi
     (
@@ -274,11 +283,12 @@ copyToAllRegions() {
         )
 
         echo "[$reg] Tagging Copied AMI ${amiCopyID}"
-        AWS ec2 create-tags --resources "${imageID}" --tags \
-          --tags Key=Name,Value="${imageName}" Key=Project,Value=Kairos
       fi
 
       waitAMI "${amiCopyID}" "${reg}"
+      aws --profile "$AWS_PROFILE" --region "$reg" ec2 create-tags \
+        --resources "${amiCopyID}" \
+        --tags Key=Name,Value="${imageName}" Key=Project,Value=Kairos Key=KairosVersion,Value="${kairosVersion}"
       makeAMIpublic "${amiCopyID}" "${reg}"
 
       echo "[$reg] AMI Copied: ${amiCopyID}"
@@ -290,11 +300,12 @@ copyToAllRegions() {
 
 # ----- Main script -----
 baseName=$(basename "$1")
+kairosVersion="$2"
 checkEnvVars
 checkArguments "$@"
 # This is an one-off operation and require additional permissions which we don't need to give to CI.
 #ensureVmImportRole
-uploadImageToS3 "$1"
-output=$(importAsSnapshot "$baseName" | tee /dev/fd/2)
+uploadImageToS3 "$1" "$kairosVersion"
+output=$(importAsSnapshot "$baseName" "$kairosVersion"| tee /dev/fd/2)
 snapshotID=$(echo "$output" | tail -1)
-checkImageExistsOrCreate "$baseName" "$snapshotID"
+checkImageExistsOrCreate "$baseName" "$snapshotID" "$kairosVersion"
