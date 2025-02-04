@@ -5,28 +5,30 @@ set -o pipefail
 
 set -x
 
-amiDeleteIfMissingTag() {
+amiDeleteIfNotInVersionList() {
   local reg=$1
   local img=$2
-  local tagToCheck=$3
+  shift 2
+  local versionList=("$@")
 
   # get all image tags
   mapfile -t imgTags < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-images --image-ids $img --query 'Images[].Tags[]' --output text)
   TagExists=false
   for tag in "${imgTags[@]}"; do
-      echo $tag
+    for tagToCheck in "${versionList[@]}"; do
       if [[ $tag == *"$tagToCheck"* ]]; then
-          TagExists=true
-          break
+        echo "AMI $img has the '$tagToCheck' tag. Skipping cleanup."
+        TagExists=true
+        break
       fi
+    done
   done
 
   # If the "KairosVersion" tag does not exist, delete the AMI
   if [ "$TagExists" = false ]; then
-      aws --profile $AWS_PROFILE --region $reg ec2 deregister-image --image-id $img
-      echo "AMI $img deleted because it does not have the '$tagToCheck' tag."
-  else
-      echo "AMI $img has the '$tagToCheck' tag."
+      # TODO: Uncomment this line to delete the AMI
+      #aws --profile $AWS_PROFILE --region $reg ec2 deregister-image --image-id $img
+      echo "AMI $img deleted because it does not match any of the versions: '${versionList[@]}'."
   fi
 }
 
@@ -59,13 +61,14 @@ getHighest4StableVersions() {
 cleanupOldVersionsRegion() {
   local reg=$1
 
-  mapfile -t allAmis < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-images --owners self --query 'Images[].ImageId' --output text)
-  for img in "${allAmis[@]}"; do
-    amiDeleteIfMissingTag $reg $img "KairosVersion"
-  done
-
   highest4StableVersions=($(getHighest4StableVersions "$reg"))
   echo "Highest 4 stable versions: ${highest4StableVersions[@]}"
+
+  mapfile -t allAmis < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-images --owners self --query 'Images[].ImageId' --output text)
+  for img in "${allAmis[@]}"; do
+    amiDeleteIfNotInVersionList $reg $img "${highest4StableVersions[@]}"
+  done
+
   # TODO:
   # - Delete all AMIs that are not in the highest 4 stable versions
   # - Cleanup snapshots that don't have an associated AMI
