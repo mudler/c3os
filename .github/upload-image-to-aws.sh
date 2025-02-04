@@ -299,6 +299,7 @@ copyToAllRegions() {
 }
 
 # ----- Main script -----
+#cleanupOldVersions
 baseName=$(basename "$1")
 kairosVersion="$2"
 checkEnvVars
