@@ -3,7 +3,7 @@
 set -e
 set -o pipefail
 
-set -x
+#set -x
 
 amiDeleteIfNotInVersionList() {
   local reg=$1
@@ -16,18 +16,17 @@ amiDeleteIfNotInVersionList() {
   TagExists=false
   for tag in "${imgTags[@]}"; do
     for tagToCheck in "${versionList[@]}"; do
-      if [[ $tag == *"$tagToCheck"* ]]; then
-        echo "AMI $img has the '$tagToCheck' tag. Skipping cleanup."
+      if [[ $tag == "KairosVersion"*"$tagToCheck" ]]; then
+        echo "[$reg] AMI $img has the '$tagToCheck' tag. Skipping cleanup."
         TagExists=true
-        break
+        break 2
       fi
     done
   done
 
   if [ "$TagExists" = false ]; then
-      # TODO: Uncomment this line to delete the AMI
-      #aws --profile $AWS_PROFILE --region $reg ec2 deregister-image --image-id $img
-      echo "AMI $img deleted because it does not match any of the versions: '${versionList[@]}'."
+      aws --profile $AWS_PROFILE --region $reg ec2 deregister-image --image-id $img
+      echo "[$reg] AMI $img deleted because it does not match any of the versions: '${versionList[@]}'."
   fi
 }
 
@@ -42,8 +41,8 @@ snapshotDeleteIfNotInVersionList() {
   TagExists=false
   for tag in "${snapshotTags[@]}"; do
     for tagToCheck in "${versionList[@]}"; do
-      if [[ $tag == *"$tagToCheck"* ]]; then
-        echo "Snapshot $snapshot has the '$tagToCheck' tag. Skipping cleanup."
+      if [[ $tag == "KairosVersion"*"$tagToCheck" ]]; then
+        echo "[$reg] Snapshot $snapshot has the '$tagToCheck' tag. Skipping cleanup."
         TagExists=true
         break
       fi
@@ -51,9 +50,8 @@ snapshotDeleteIfNotInVersionList() {
   done
 
   if [ "$TagExists" = false ]; then
-    # TODO: Uncomment this line to delete the snapshot
-    # aws --profile $AWS_PROFILE --region $reg ec2 delete-snapshot --snapshot-id $snapshot
-    echo "Snapshot $snapshot deleted because it does not match any of the versions: '${versionList[@]}'."
+    (aws --profile $AWS_PROFILE --region $reg ec2 delete-snapshot --snapshot-id $snapshot && \
+      echo "[$reg] Snapshot $snapshot deleted because it does not match any of the versions: '${versionList[@]}'.") || true
   fi
 }
 
@@ -64,22 +62,21 @@ s3ObjectDeleteIfNotInVersionList() {
   local versionList=("$@")
 
   # Get all S3 object tags
-  mapfile -t s3Tags < <(aws --profile $AWS_PROFILE s3api get-object-tagging --bucket "$bucket" --key "$key" --query 'TagSet[].Value' --output text)
+  mapfile -t s3Tags < <(aws --profile $AWS_PROFILE s3api get-object-tagging --bucket "$bucket" --key "$key" --query 'TagSet[]' --output text)
 
   TagExists=false
   for tag in "${s3Tags[@]}"; do
     for tagToCheck in "${versionList[@]}"; do
-      if [[ $tag == *"$tagToCheck"* ]]; then
-        echo "S3 object $key in bucket $bucket has the '$tagToCheck' tag. Skipping cleanup."
+      if [[ $tag == "KairosVersion"*"$tagToCheck" ]]; then
+        echo "S3 object '$key' in bucket '$bucket' has the '$tagToCheck' tag. Skipping cleanup."
         TagExists=true
-        break
+        break 2
       fi
     done
   done
 
   if [ "$TagExists" = false ]; then
-    # TODO: Uncomment this line to delete the S3 object
-    # aws --profile $AWS_PROFILE s3api delete-object --bucket "$bucket" --key "$key"
+    aws --profile $AWS_PROFILE s3api delete-object --bucket "$bucket" --key "$key"
     echo "S3 object $key in bucket $bucket deleted because it does not match any of the versions: '${versionList[@]}'."
   fi
 }
@@ -102,9 +99,9 @@ getHighest4StableVersions() {
   done
 
   # Sort the stable versions and keep only the highest 4
-  IFS=$'\n' sortedVersions=($(sort -V <<<"${stableVersions[*]}"))
+  IFS=$'\n' sortedVersions=($(sort -V -r <<<"${stableVersions[*]}"))
   unset IFS
-  highest4StableVersions=("${sortedVersions[@]: -4}")
+  highest4StableVersions=("${sortedVersions[@]:0:4}")
 
   # Return the highest 4 stable versions
   echo "${highest4StableVersions[@]}"
@@ -112,27 +109,29 @@ getHighest4StableVersions() {
 
 cleanupOldVersionsRegion() {
   local reg=$1
-
-  highest4StableVersions=($(getHighest4StableVersions "$reg"))
-  echo "Highest 4 stable versions: ${highest4StableVersions[@]}"
+  shift 1
+  local versionList=("$@")
 
   # Cleanup AMIs
-  mapfile -t allAmis < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-images --owners self --query 'Images[].ImageId' --output text)
+  mapfile -t allAmis < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-images --owners self --query 'Images[].ImageId' --output text | tr '\t' '\n')
   for img in "${allAmis[@]}"; do
-    amiDeleteIfNotInVersionList $reg $img "${highest4StableVersions[@]}"
+    amiDeleteIfNotInVersionList $reg $img "${versionList[@]}"
   done
 
   # Cleanup Snapshots
   mapfile -t allSnapshots < <(aws --profile $AWS_PROFILE --region $reg ec2 describe-snapshots --owner-ids self --query 'Snapshots[].SnapshotId' --output text | tr '\t' '\n')
   for snapshot in "${allSnapshots[@]}"; do
-    snapshotDeleteIfNotInVersionList $reg $snapshot "${highest4StableVersions[@]}"
+    snapshotDeleteIfNotInVersionList $reg $snapshot "${versionList[@]}"
   done
 }
 
 cleanupOldVersions() {
-  mapfile -t regions < <(AWS ec2 describe-regions | jq -r '.Regions[].RegionName')
+  highest4StableVersions=($(getHighest4StableVersions "$AWS_REGION"))
+  echo "Highest 4 stable versions (in region $AWS_REGION): ${highest4StableVersions[@]}"
+
+  mapfile -t regions < <(aws --profile $AWS_PROFILE ec2 describe-regions | jq -r '.Regions[].RegionName')
   for reg in "${regions[@]}"; do
-    cleanupOldVersionsRegion "$reg"
+    cleanupOldVersionsRegion "$reg" "${highest4StableVersions[@]}"
   done
 
   # Cleanup S3 Objects

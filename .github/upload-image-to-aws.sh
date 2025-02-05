@@ -10,6 +10,8 @@
 set -e
 set -o pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cleanup-old-images.sh"
+
 checkArguments() {
   if [ $# -lt 2 ]; then
     echo "Error: You need to specify the cloud image to upload and the Kairos version (to tag resources)."
@@ -179,7 +181,7 @@ EOF
   snapshotID=$(waitForSnapshotCompletion "$taskID" | tail -1 | tee /dev/fd/2)
   echo "Adding tag to the snapshot with ID: $snapshotID"
   AWS ec2 create-tags --resources "$snapshotID" \
-    --tags Key=Name,Value=$file, Key=SourceFile,Value=$file Key=KairosVersion,Value=$kairosVersion
+    --tags Key=Name,Value="${file}" Key=SourceFile,Value="${file}" Key=KairosVersion,Value="${kairosVersion}"
 
   echo "$snapshotID" # Return the snapshot ID so that we can grab it with `tail -1`
 }
@@ -286,7 +288,17 @@ copyToAllRegions() {
       fi
 
       waitAMI "${amiCopyID}" "${reg}"
-      aws --profile "$AWS_PROFILE" --region "$reg" ec2 create-tags \
+
+      snapshotCopyID=$(aws ec2 describe-images \
+        --image-ids "${amiCopyID}" \
+        --region ${reg} \
+        --query 'Images[0].BlockDeviceMappings[0].Ebs.SnapshotId' \
+        --output text)
+      aws --profile "${AWS_PROFILE}" --region "${reg}" ec2 create-tags \
+        --resources "${snapshotCopyID}" \
+        --tags Key=Name,Value="${imageName}" Key=SourceFile,Value="${imageName}" Key=KairosVersion,Value="${kairosVersion}"
+
+      aws --profile "$AWS_PROFILE" --region "${reg}" ec2 create-tags \
         --resources "${amiCopyID}" \
         --tags Key=Name,Value="${imageName}" Key=Project,Value=Kairos Key=KairosVersion,Value="${kairosVersion}"
       makeAMIpublic "${amiCopyID}" "${reg}"
@@ -299,11 +311,13 @@ copyToAllRegions() {
 }
 
 # ----- Main script -----
-#cleanupOldVersions
 baseName=$(basename "$1")
 kairosVersion="$2"
 checkEnvVars
 checkArguments "$@"
+
+cleanupOldVersions
+
 # This is an one-off operation and require additional permissions which we don't need to give to CI.
 #ensureVmImportRole
 uploadImageToS3 "$1" "$kairosVersion"
